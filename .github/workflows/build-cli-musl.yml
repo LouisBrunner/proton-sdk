@@ -1,0 +1,123 @@
+name: Build CLI musl binaries
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "CLI version to build (e.g. 0.4.6). Defaults to latest upstream tag."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  get-version:
+    name: Get version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - name: Resolve CLI version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            CLI_VERSION="${{ inputs.version }}"
+          else
+            CLI_VERSION=$(git ls-remote --tags https://github.com/ProtonDriveApps/sdk.git 'refs/tags/cli/v*' \
+              | awk '{print $2}' | sed 's|refs/tags/cli/v||' | sort -V | tail -1)
+          fi
+          echo "version=${CLI_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=cli/v${CLI_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=v${CLI_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        id: check
+        run: |
+          if gh release view "${{ steps.version.outputs.release_tag }}" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${{ steps.version.outputs.release_tag }} already exists, skipping build."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: get-version
+    if: needs.get-version.outputs.exists == 'false'
+    steps:
+      - name: Checkout upstream at tag
+        uses: actions/checkout@v7
+        with:
+          repository: ProtonDriveApps/sdk
+          ref: ${{ needs.get-version.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install dependencies
+        run: |
+          cd js/sdk && bun install
+          cd ../cli && bun install --frozen-lockfile
+
+      - name: Build linux-arm64-musl
+        working-directory: js/cli
+        env:
+          CLI_VERSION: ${{ needs.get-version.outputs.version }}
+        run: bun run build -- bun-linux-arm64-musl
+
+      - name: Build linux-x64-musl
+        working-directory: js/cli
+        env:
+          CLI_VERSION: ${{ needs.get-version.outputs.version }}
+        run: bun run build -- bun-linux-x64-musl-baseline
+
+      - name: Prepare artifacts and checksums
+        working-directory: js/cli
+        run: |
+          mv release/linux-arm64-musl/proton-drive proton-drive-linux-arm64-musl
+          mv release/linux-x64-musl-baseline/proton-drive proton-drive-linux-x64-musl
+          sha512sum proton-drive-linux-arm64-musl proton-drive-linux-x64-musl > checksums.sha512
+          cat checksums.sha512
+
+      - name: Create GitHub release
+        working-directory: js/cli
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.get-version.outputs.tag }}
+          RELEASE_TAG: ${{ needs.get-version.outputs.release_tag }}
+          VERSION: ${{ needs.get-version.outputs.version }}
+        run: |
+          ARM64=$(awk 'NR==1{print $1}' checksums.sha512)
+          X64=$(awk  'NR==2{print $1}' checksums.sha512)
+          NOTES=$(cat <<EOF
+          Musl builds of Proton Drive CLI v${VERSION}, for use with musl-based Linux distributions (Alpine, Home Assistant OS).
+
+          Built from [ProtonDriveApps/sdk@${TAG}](https://github.com/ProtonDriveApps/sdk/tree/${TAG}).
+
+          ## SHA-512 Checksums
+
+          \`\`\`
+          arm64-musl  ${ARM64}
+          x64-musl    ${X64}
+          \`\`\`
+          EOF
+          )
+          gh release create "${RELEASE_TAG}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "CLI v${VERSION} (musl)" \
+            --notes "${NOTES}" \
+            proton-drive-linux-arm64-musl \
+            proton-drive-linux-x64-musl \
+            checksums.sha512
